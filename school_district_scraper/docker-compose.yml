@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  scraper:
+    build: .
+    volumes:
+      - .:/app
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    # Default command, can be overridden
+    command: python scraper.py -i input_districts.csv -o output_results.csv --use-llm
