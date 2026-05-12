@@ -1,0 +1,62 @@
+name: Run School District Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_llm:
+        description: 'Use OpenAI LLM for extraction (requires OPENAI_API_KEY secret)'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          cd school_district_scraper
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check for input_districts.csv
+        id: check_files
+        uses: andstor/file-existence-action@v2
+        with:
+          files: "school_district_scraper/input_districts.csv"
+
+      - name: Run Scraper (Basic Mode)
+        if: steps.check_files.outputs.files_exists == 'true' && github.event.inputs.use_llm == 'false'
+        run: |
+          cd school_district_scraper
+          python scraper.py -i input_districts.csv -o output_results.csv
+
+      - name: Run Scraper (LLM Mode)
+        if: steps.check_files.outputs.files_exists == 'true' && github.event.inputs.use_llm == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          cd school_district_scraper
+          python scraper.py -i input_districts.csv -o output_results.csv --use-llm
+
+      - name: Upload Results
+        if: steps.check_files.outputs.files_exists == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: scraper-results
+          path: school_district_scraper/output_results.csv
+
+      - name: Missing Input File Warning
+        if: steps.check_files.outputs.files_exists == 'false'
+        run: |
+          echo "::error::input_districts.csv not found in the school_district_scraper directory. Please commit this file before running the action."
+          exit 1
