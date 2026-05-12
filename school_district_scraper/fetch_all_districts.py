@@ -2,7 +2,6 @@ import requests
 import json
 import csv
 import logging
-import os
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
@@ -26,30 +25,24 @@ def fetch_all_school_districts(output_csv):
 
             for district in results:
                 name = district.get("lea_name")
-                # Agency Type 1 = Local school district that is not a component of a supervisory union.
-                # Agency Type 2 = Local school district component of a supervisory union sharing a superintendent and administrative services with other local school districts.
-                # Just filter out empty names or generic state agencies (agency_type >= 4 usually state/fed agencies, but 1 and 2 are normal public school districts)
+                state = district.get("state_location") # Get the state to improve search accuracy
                 agency_type = district.get("agency_type", 0)
-                if name and agency_type in [1, 2, 3]:
-                    # Cleaning up names (e.g. "Albertville City" -> "Albertville City School District" if it doesn't have district in name, but we'll leave as is to be accurate)
-                    # Exclude obvious non-districts
+                if name and state and agency_type in [1, 2, 3]:
                     if "Department of Education" not in name:
-                        districts.add(name)
+                        districts.add((name, state))
 
             url = data.get("next")
 
-            # Print progress
             if len(districts) % 1000 < 50 and len(districts) > 0:
                 logging.info(f"Loaded {len(districts)} districts...")
 
-        # Write to output CSV
         logging.info(f"Successfully retrieved {len(districts)} unique school districts. Writing to {output_csv}...")
 
         with open(output_csv, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
-            writer.writerow(["District Name"])
-            for district in sorted(districts):
-                writer.writerow([district])
+            writer.writerow(["District Name", "State"])
+            for district_tuple in sorted(list(districts)):
+                writer.writerow([district_tuple[0], district_tuple[1]])
 
         logging.info("Complete.")
 

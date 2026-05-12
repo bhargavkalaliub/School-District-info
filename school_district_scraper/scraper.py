@@ -8,12 +8,11 @@ import logging
 import os
 import urllib.parse
 from googlesearch import search
-import time
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-def get_official_domain(district_name):
-    query = f'"{district_name}" official website'
+def get_official_domain(district_name, state=""):
+    query = f'"{district_name}" {state} official website'
     try:
         urls = list(search(query, num_results=2, sleep_interval=2))
         for url in urls:
@@ -30,10 +29,11 @@ def extract_contact_with_llm(text):
         client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
         prompt = f"""
-        Extract the Name, Title, and Email of the person related to "Food Service" or "Child Nutrition" from the following website text.
-        If you find multiple, return the highest ranking one (Director, Manager, etc).
-        If you cannot find the information, reply with 'Not Found' for that field.
-        Format your response exactly as JSON: {{"Name": "...", "Title": "...", "Email": "..."}}
+        Extract the Name, Title, and Email of EVERY person you can find who works in the "Food Service" or "Child Nutrition" department from the following website text.
+        This includes Directors, Managers, Dietitians, Supervisors, Buyers, Coordinators, and standard staff.
+        Return it as a JSON object containing a list named 'contacts'.
+        If you cannot find anyone, return an empty list for 'contacts'.
+        Format: {{"contacts": [{{"Name": "...", "Title": "...", "Email": "..."}}]}}
 
         Text: {text[:8000]}
         """
@@ -46,17 +46,17 @@ def extract_contact_with_llm(text):
         )
 
         import json
-        return json.loads(response.choices[0].message.content)
+        return json.loads(response.choices[0].message.content).get('contacts', [])
     except Exception as e:
         logging.error(f"LLM Extraction failed: {e}")
-        return {"Name": "Not Found", "Title": "Not Found", "Email": "Not Found"}
+        return []
 
-def crawl_for_nutrition_contact(district_name, use_llm=False):
-    logging.info(f"Looking up domain for {district_name}...")
-    domain = get_official_domain(district_name)
+def crawl_for_nutrition_contact(district_name, state="", use_llm=False):
+    logging.info(f"Looking up domain for {district_name} ({state})...")
+    domain = get_official_domain(district_name, state)
 
     if not domain:
-        return "Not Found", "Not Found", "Not Found (No website found)"
+        return []
 
     logging.info(f"Found domain: {domain}")
 
@@ -64,7 +64,7 @@ def crawl_for_nutrition_contact(district_name, use_llm=False):
     query = f'site:{urllib.parse.urlparse(domain).netloc} "food service" OR "child nutrition" directory OR staff email'
 
     try:
-        page_urls = list(search(query, num_results=2))
+        page_urls = list(search(query, num_results=2, sleep_interval=2))
         if not page_urls:
             page_urls = [domain] # fallback to homepage
     except:
@@ -88,21 +88,20 @@ def crawl_for_nutrition_contact(district_name, use_llm=False):
             logging.error(f"Failed to crawl {url}: {e}")
 
     if use_llm and os.environ.get("OPENAI_API_KEY") and all_text:
-        extracted = extract_contact_with_llm(all_text)
-        name = extracted.get("Name", "Not Found")
-        title = extracted.get("Title", "Not Found")
-        email = extracted.get("Email", "Not Found")
+        contacts = extract_contact_with_llm(all_text)
+        if contacts:
+            return contacts
 
-        # Fallback to regex emails if LLM misses it
-        if email == "Not Found" and emails:
-            email = list(emails)[0]
 
-        return name, title, email
-
+    fallback_contacts = []
     if emails:
-        return "Name not extracted", "Food Service/Child Nutrition Contact", list(emails)[0]
-
-    return "Not Found", "Not Found", "Not Found"
+        for e in list(emails)[:3]: # limit to 3 to prevent huge rows
+            fallback_contacts.append({
+                "Name": "Name not extracted",
+                "Title": "Food Service/Child Nutrition Contact",
+                "Email": e
+            })
+    return fallback_contacts
 
 def process_districts(input_csv, output_csv, use_llm=False):
     try:
@@ -119,18 +118,32 @@ def process_districts(input_csv, output_csv, use_llm=False):
 
     for index, row in df.iterrows():
         district_name = row['District Name']
-        logging.info(f"Processing District: {district_name}")
+        state = row.get('State', '')
+        logging.info(f"Processing District: {district_name} {state}")
 
-        name, title, email = crawl_for_nutrition_contact(district_name, use_llm)
+        contacts = crawl_for_nutrition_contact(district_name, state, use_llm)
 
-        district_info = {
-            'District Name': district_name,
-            'Child Nutrition / Food Service - Name': name,
-            'Child Nutrition / Food Service - Title': title,
-            'Child Nutrition / Food Service - Email': email
-        }
+        if not contacts:
+             district_info = {
+                'District Name': district_name,
+                'State': state,
+                'Child Nutrition / Food Service Role 1 - Name': 'Not Found',
+                'Child Nutrition / Food Service Role 1 - Title': 'Not Found',
+                'Child Nutrition / Food Service Role 1 - Email': 'Not Found'
+             }
+             output_data.append(district_info)
+        else:
+            district_info = {
+                'District Name': district_name,
+                'State': state
+            }
+            # Add up to 5 contacts found
+            for i, c in enumerate(contacts[:5]):
+                district_info[f'Child Nutrition / Food Service Role {i+1} - Name'] = c.get('Name', 'Not Found')
+                district_info[f'Child Nutrition / Food Service Role {i+1} - Title'] = c.get('Title', 'Not Found')
+                district_info[f'Child Nutrition / Food Service Role {i+1} - Email'] = c.get('Email', 'Not Found')
 
-        output_data.append(district_info)
+            output_data.append(district_info)
 
         pd.DataFrame(output_data).to_csv(output_csv, index=False)
         logging.info(f"Saved progress for {district_name} to {output_csv}")
