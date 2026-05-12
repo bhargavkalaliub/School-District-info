@@ -4,39 +4,42 @@ from bs4 import BeautifulSoup
 import re
 import time
 import argparse
-from duckduckgo_search import DDGS
 import logging
 import os
+import urllib.parse
+from googlesearch import search
+import time
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-ROLES = [
-    "Director of Child Nutrition / Food Service Director",
-    "Director of Nutrition Services / Assistant Director",
-    "Dietitian / Registered Dietitian",
-    "Menu Planner / SNS (School Nutrition Specialist)",
-    "Nutrition Specialist / Procurement Specialist",
-    "Buyer / Coordinator",
-    "Field Supervisor / Supervisor",
-    "Cafeteria Manager / Area Manager",
-    "Production Manager"
-]
+def get_official_domain(district_name):
+    query = f'"{district_name}" official website'
+    try:
+        urls = list(search(query, num_results=2, sleep_interval=2))
+        for url in urls:
+            if "wikipedia" not in url and "facebook" not in url and "nces" not in url and "niche.com" not in url and "publicschoolreview" not in url:
+                parsed = urllib.parse.urlparse(url)
+                return f"{parsed.scheme}://{parsed.netloc}"
+    except Exception as e:
+        logging.error(f"Search failed for domain: {e}")
+    return None
 
-def extract_contact_with_llm(snippet, role):
+def extract_contact_with_llm(text):
     try:
         from openai import OpenAI
         client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
         prompt = f"""
-        Extract the Name, Title, and Email for the role roughly matching '{role}' from the following search snippet.
+        Extract the Name, Title, and Email of the person related to "Food Service" or "Child Nutrition" from the following website text.
+        If you find multiple, return the highest ranking one (Director, Manager, etc).
         If you cannot find the information, reply with 'Not Found' for that field.
         Format your response exactly as JSON: {{"Name": "...", "Title": "...", "Email": "..."}}
 
-        Snippet: {snippet}
+        Text: {text[:8000]}
         """
 
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             response_format={ "type": "json_object" }
@@ -48,55 +51,58 @@ def extract_contact_with_llm(snippet, role):
         logging.error(f"LLM Extraction failed: {e}")
         return {"Name": "Not Found", "Title": "Not Found", "Email": "Not Found"}
 
-def search_role_for_district(district_name, role, ddgs, use_llm=False):
-    """
-    Use DuckDuckGo to search for the role in the district.
-    We try a very specific targeted search first.
-    """
-    # First, get a highly targeted query
-    role_query = " OR ".join([f'"{r.strip()}"' for r in role.split('/')])
+def crawl_for_nutrition_contact(district_name, use_llm=False):
+    logging.info(f"Looking up domain for {district_name}...")
+    domain = get_official_domain(district_name)
 
-    # Try an exact quote match search for better results
-    query = f'"{district_name}" {role_query} email OR contact'
+    if not domain:
+        return "Not Found", "Not Found", "Not Found (No website found)"
 
-    logging.info(f"Searching: {query}")
+    logging.info(f"Found domain: {domain}")
+
+    # We will search google for the specific nutrition page on that domain
+    query = f'site:{urllib.parse.urlparse(domain).netloc} "food service" OR "child nutrition" directory OR staff email'
 
     try:
-        results = list(ddgs.text(query, max_results=5))
-    except Exception as e:
-        logging.error(f"Search failed for {query}: {e}")
-        return "Not Found", "Not Found", "Not Found"
+        page_urls = list(search(query, num_results=2))
+        if not page_urls:
+            page_urls = [domain] # fallback to homepage
+    except:
+        page_urls = [domain]
 
-    if not results:
-        # Fallback query if no results
-        query = f'{district_name} {role.split("/")[0]} email'
-        logging.info(f"Fallback Searching: {query}")
+    all_text = ""
+    emails = set()
+
+    for url in page_urls:
+        logging.info(f"Crawling {url}...")
         try:
-            results = list(ddgs.text(query, max_results=5))
-        except:
-            return "Not Found", "Not Found", "Not Found"
+            res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            text = soup.get_text(separator=' ', strip=True)
+            all_text += text + "\n"
 
-    if not results:
-        return "Not Found", "Not Found", "Not Found"
+            found_emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+            for e in found_emails:
+                emails.add(e)
+        except Exception as e:
+            logging.error(f"Failed to crawl {url}: {e}")
 
-    combined_snippet = " ".join([res.get('body', '') + ' ' + res.get('title', '') for res in results])
+    if use_llm and os.environ.get("OPENAI_API_KEY") and all_text:
+        extracted = extract_contact_with_llm(all_text)
+        name = extracted.get("Name", "Not Found")
+        title = extracted.get("Title", "Not Found")
+        email = extracted.get("Email", "Not Found")
 
-    if use_llm and os.environ.get("OPENAI_API_KEY"):
-        extracted = extract_contact_with_llm(combined_snippet, role)
-        return extracted.get("Name", "Not Found"), extracted.get("Title", "Not Found"), extracted.get("Email", "Not Found")
-    else:
-        email_regex = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-        emails = re.findall(email_regex, combined_snippet)
+        # Fallback to regex emails if LLM misses it
+        if email == "Not Found" and emails:
+            email = list(emails)[0]
 
-        # Look for names using simple title case matching around the email
-        # This is basic, but better than 'Requires manual review'
-        name_found = "Name in snippet"
+        return name, title, email
 
-        if emails:
-            return name_found, role.split('/')[0].strip(), emails[0]
+    if emails:
+        return "Name not extracted", "Food Service/Child Nutrition Contact", list(emails)[0]
 
-        # Return snippet as 'Title' if no email is found, so user at least gets SOMETHING
-        return "Not Found", "See Snippet: " + combined_snippet[:100] + "...", "Not Found"
+    return "Not Found", "Not Found", "Not Found"
 
 def process_districts(input_csv, output_csv, use_llm=False):
     try:
@@ -111,35 +117,31 @@ def process_districts(input_csv, output_csv, use_llm=False):
 
     output_data = []
 
-    with DDGS() as ddgs:
-        for index, row in df.iterrows():
-            district_name = row['District Name']
-            logging.info(f"Processing District: {district_name}")
+    for index, row in df.iterrows():
+        district_name = row['District Name']
+        logging.info(f"Processing District: {district_name}")
 
-            district_info = {'District Name': district_name}
+        name, title, email = crawl_for_nutrition_contact(district_name, use_llm)
 
-            for role in ROLES:
-                name, found_title, email = search_role_for_district(district_name, role, ddgs, use_llm)
+        district_info = {
+            'District Name': district_name,
+            'Child Nutrition / Food Service - Name': name,
+            'Child Nutrition / Food Service - Title': title,
+            'Child Nutrition / Food Service - Email': email
+        }
 
-                # To avoid hitting rate limits too quickly
-                time.sleep(2)
+        output_data.append(district_info)
 
-                role_key = role.split('/')[0].strip()
-                district_info[f"{role_key} - Name"] = name
-                district_info[f"{role_key} - Title"] = found_title
-                district_info[f"{role_key} - Email"] = email
+        pd.DataFrame(output_data).to_csv(output_csv, index=False)
+        logging.info(f"Saved progress for {district_name} to {output_csv}")
 
-            output_data.append(district_info)
-
-            # Save progress incrementally
-            pd.DataFrame(output_data).to_csv(output_csv, index=False)
-            logging.info(f"Saved progress for {district_name} to {output_csv}")
+        time.sleep(2) # Prevent rate limiting
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scrape school district nutrition staff contacts.")
     parser.add_argument('-i', '--input', required=True, help="Input CSV file containing a 'District Name' column")
     parser.add_argument('-o', '--output', required=True, help="Output CSV file path")
-    parser.add_argument('--use-llm', action='store_true', help="Use OpenAI API for better name/title extraction (requires OPENAI_API_KEY env variable)")
+    parser.add_argument('--use-llm', action='store_true', help="Use OpenAI API for better extraction (requires OPENAI_API_KEY env variable)")
 
     args = parser.parse_args()
     process_districts(args.input, args.output, args.use_llm)
