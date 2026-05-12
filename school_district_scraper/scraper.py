@@ -98,23 +98,6 @@ def search_role_for_district(district_name, role, ddgs, use_llm=False):
         # Return snippet as 'Title' if no email is found, so user at least gets SOMETHING
         return "Not Found", "See Snippet: " + combined_snippet[:100] + "...", "Not Found"
 
-    if not results:
-        return "Not Found", "Not Found", "Not Found"
-
-    combined_snippet = " ".join([res.get('body', '') + ' ' + res.get('title', '') for res in results])
-
-    if use_llm and os.environ.get("OPENAI_API_KEY"):
-        extracted = extract_contact_with_llm(combined_snippet, role)
-        return extracted.get("Name", "Not Found"), extracted.get("Title", "Not Found"), extracted.get("Email", "Not Found")
-    else:
-        email_regex = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-        emails = re.findall(email_regex, combined_snippet)
-        if emails:
-            # We found an email, but extracting the exact name without LLM is hard
-            return "Name in snippet (requires manual review)", role, emails[0]
-
-    return "Not Found", "Not Found", "Not Found"
-
 def process_districts(input_csv, output_csv, use_llm=False):
     try:
         df = pd.read_csv(input_csv)

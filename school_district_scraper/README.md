@@ -52,6 +52,12 @@ If you host this repository on GitHub, you can run the scraper directly from the
 
 Create an input CSV file (e.g., `input_districts.csv`) with at least one column titled **exactly**: `District Name`.
 
+*Note: You can generate a comprehensive list of all ~13,500 public school districts in the United States by running the included `fetch_all_districts.py` script. This script pulls the latest directory directly from the National Center for Education Statistics (NCES) API and outputs it to `input_districts.csv`.*
+
+```bash
+python fetch_all_districts.py
+```
+
 Example `input_districts.csv`:
 ```csv
 District Name
