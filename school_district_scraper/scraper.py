@@ -30,24 +30,6 @@ def get_domain_from_urban_api(district_name, state=""):
     return None
 
 def get_official_domain(district_name, state=""):
-    # Bing is much more reliable and doesn't block as aggressively as Google or DuckDuckGo
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    query = f'{district_name} {state} school district official website'
-    url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
-
-    try:
-        res = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for a in soup.find_all('a'):
-            href = a.get('href')
-            if href and href.startswith('http') and 'bing' not in href and 'microsoft' not in href:
-                domain = urllib.parse.urlparse(href).netloc.lower()
-                if any(x in domain for x in ['wikipedia', 'facebook', 'nces', 'niche', 'publicschoolreview', 'usnews', 'mapquest', 'greatschools', 'schooldigger', 'hometownlocator', 'yahoo', 'yellowpages', 'privateschoolreview', 'texastribune', 'local.', 'city-data', 'zillow', 'realtor', 'google', 'twitter']):
-                    continue
-                return f"{urllib.parse.urlparse(href).scheme}://{domain}"
-    except Exception as e:
-        logging.warning(f"Bing search failed: {e}")
-
     query = f'{district_name} {state} school district official website'
     url = "https://lite.duckduckgo.com/lite/"
 
@@ -66,7 +48,7 @@ def get_official_domain(district_name, state=""):
     data = {"q": query}
     try:
         session = requests.Session()
-        res = session.post(url, headers=headers, data=data, timeout=10)
+        res = session.post(url, headers=headers, data=data, timeout=5)
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, 'html.parser')
             for a in soup.find_all('a'):
@@ -81,7 +63,7 @@ def get_official_domain(district_name, state=""):
 
     try:
         url = "https://html.duckduckgo.com/html/"
-        res = requests.post(url, headers=headers, data=data, timeout=10)
+        res = requests.post(url, headers=headers, data=data, timeout=5)
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, 'html.parser')
             for a in soup.find_all('a', class_='result__url'):
@@ -131,31 +113,33 @@ def extract_contact_with_llm(text):
         logging.error(f"LLM Extraction failed: {e}")
         return []
 
-
-def crawl_for_nutrition_contact(district_name, state="", use_llm=False):
+def crawl_for_nutrition_contact(district_name, state="", website="", use_llm=False):
     logging.info(f"Looking up domain for {district_name} ({state})...")
 
     domain = None
-    for attempt in range(2):
-        domain = get_official_domain(district_name, state)
-        if domain:
-            break
-        time.sleep(2)
+    if pd.notna(website) and website and website != "None":
+        domain = str(website)
+        if not domain.startswith('http'):
+            domain = 'https://' + domain
+    else:
+        for attempt in range(1):
+            domain = get_official_domain(district_name, state)
+            if domain:
+                break
 
-    if not domain:
-        clean_name = re.sub(r'[^a-zA-Z0-9]', '', district_name).lower()
-        if "isd" in clean_name:
-            domain = f"https://www.{clean_name}.org"
-        elif "usd" in clean_name:
-            domain = f"https://www.{clean_name}.org"
-        else:
-            domain = f"https://www.{clean_name}.org"
-        logging.warning(f"Could not find domain via search. Guessing {domain}")
+        if not domain:
+            clean_name = re.sub(r'[^a-zA-Z0-9]', '', district_name).lower()
+            if "isd" in clean_name:
+                domain = f"https://www.{clean_name}.org"
+            elif "usd" in clean_name:
+                domain = f"https://www.{clean_name}.org"
+            else:
+                domain = f"https://www.{clean_name}.org"
+            logging.warning(f"Could not find domain via search. Guessing {domain}")
 
     logging.info(f"Found domain: {domain}")
 
     pages_to_crawl = []
-    # Add root first
     pages_to_crawl.append(domain)
 
     for path in ['/staff', '/departments', '/food-service', '/dining', '/nutrition', '/child-nutrition', '/food-and-nutrition', '/food-service-department', '/apps/staff/', '/apps/departments/', '/departments/food-service']:
@@ -164,13 +148,33 @@ def crawl_for_nutrition_contact(district_name, state="", use_llm=False):
     all_text = ""
     emails = set()
 
+    # Homepage dynamic scraping
     try:
-         for p in ['/staff', '/o/district/staff', '/departments', '/apps/staff/', '/apps/departments/', '']:
+        res = requests.get(domain, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        soup = BeautifulSoup(res.text, 'html.parser')
+
+        # Scrape dynamically found nutrition links from homepage
+        for a in soup.find_all('a'):
+            href = a.get('href')
+            text = a.get_text().lower()
+            if href and ('food' in text or 'nutrition' in text or 'dining' in text):
+                if href.startswith('/'):
+                    href = domain + href
+                if href.startswith('http') and domain in href:
+                    pages_to_crawl.append(href)
+
+        text = soup.get_text(separator='\n', strip=True)
+        if len(text) > 5 and text not in all_text:
+             all_text += text + "\n\n"
+    except:
+        pass
+
+    # Specific CMS directory locations
+    try:
+         for p in ['/staff', '/o/district/staff', '/departments', '/apps/staff/', '/apps/departments/']:
             url = f"{domain}{p}"
             res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
             soup = BeautifulSoup(res.text, 'html.parser')
-            # Look for contact information across the whole page, especially tables or list elements
-            # A lot of staff directories don't have explicit 'staff' classes, so extract raw text.
             text = soup.get_text(separator='\n', strip=True)
             if len(text) > 5 and text not in all_text:
                  all_text += text + "\n\n"
@@ -181,10 +185,14 @@ def crawl_for_nutrition_contact(district_name, state="", use_llm=False):
     except:
         pass
 
-    # No need to hit the exact same urls again since the first block does it,
-    # but we can try the ones that are left in pages_to_crawl
+    seen_urls = set()
+    unique_pages = []
+    for p in pages_to_crawl:
+        if p not in seen_urls:
+            unique_pages.append(p)
+            seen_urls.add(p)
 
-    for url in set(pages_to_crawl) - set([f"{domain}{p}" for p in ['/staff', '/o/district/staff', '/departments', '/apps/staff/', '/apps/departments/', '']]):
+    for url in unique_pages[:15]:
         logging.info(f"Crawling {url}...")
         try:
             res = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, timeout=10)
@@ -210,17 +218,13 @@ def crawl_for_nutrition_contact(district_name, state="", use_llm=False):
     lines = all_text.split('\n')
     for i, line in enumerate(lines):
         if any(kw in line.lower() for kw in food_keywords) and len(line) < 200:
-            # We found a line with a keyword, now let's get a bigger chunk of text around it to find context
             context = " ".join(lines[max(0, i-5):min(len(lines), i+6)])
             nearby_emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', context)
 
-            # Since many websites do not list emails directly, we should still extract the person's name!
             email = nearby_emails[0] if nearby_emails else "Not Found"
 
-            # Try to guess the name from nearby lines if the keyword line is just a title
             name_guess = line.strip()[:50]
-            if len(name_guess) < 5 or "director" in name_guess.lower() or "manager" in name_guess.lower():
-                # Let's see if the line before it looks like a name
+            if len(name_guess) < 5 or "director" in name_guess.lower() or "manager" in name_guess.lower() or "staff" in name_guess.lower() or "services" in name_guess.lower() or "menu" in name_guess.lower() or "update" in name_guess.lower() or "department" in name_guess.lower() or "program" in name_guess.lower():
                 if i > 0 and 5 < len(lines[i-1].strip()) < 40:
                     name_guess = lines[i-1].strip()
 
@@ -242,6 +246,9 @@ def crawl_for_nutrition_contact(district_name, state="", use_llm=False):
     seen_emails = set()
     seen_names = set()
     for c in fallback_contacts:
+        # Ignore poor quality fallback names
+        if len(c['Name']) < 4 or len(c['Name']) > 40 or any(x in c['Name'].lower() for x in ['staff', 'menu', 'update', 'department', 'program', 'service', 'nutrition']):
+             continue
         key = c['Email'] + c['Name']
         if key not in seen_names:
             unique_contacts.append(c)
@@ -265,14 +272,16 @@ def process_districts(input_csv, output_csv, use_llm=False):
     for index, row in df.iterrows():
         district_name = row['District Name']
         state = row.get('State', '')
+        website = row.get('Website', '')
         logging.info(f"Processing District: {district_name} {state}")
 
-        contacts = crawl_for_nutrition_contact(district_name, state, use_llm)
+        contacts = crawl_for_nutrition_contact(district_name, state, website, use_llm)
 
         if not contacts:
              district_info = {
                 'District Name': district_name,
                 'State': state,
+                'Website': website,
                 'Child Nutrition / Food Service Role 1 - Name': 'Not Found',
                 'Child Nutrition / Food Service Role 1 - Title': 'Not Found',
                 'Child Nutrition / Food Service Role 1 - Email': 'Not Found'
@@ -281,7 +290,8 @@ def process_districts(input_csv, output_csv, use_llm=False):
         else:
             district_info = {
                 'District Name': district_name,
-                'State': state
+                'State': state,
+                'Website': website
             }
             for i, c in enumerate(contacts[:5]):
                 district_info[f'Child Nutrition / Food Service Role {i+1} - Name'] = c.get('Name', 'Not Found')
@@ -292,8 +302,6 @@ def process_districts(input_csv, output_csv, use_llm=False):
 
         pd.DataFrame(output_data).to_csv(output_csv, index=False)
         logging.info(f"Saved progress for {district_name} to {output_csv}")
-
-        time.sleep(2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scrape school district nutrition staff contacts.")

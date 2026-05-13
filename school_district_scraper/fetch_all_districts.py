@@ -2,12 +2,15 @@ import requests
 import json
 import csv
 import logging
+import time
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 def fetch_all_school_districts(output_csv):
     base_url = "https://educationdata.urban.org/api/v1/school-districts/ccd/directory/2021/"
-    districts = set()
+
+    # Store both the district and the known URL
+    districts = {}
 
     url = base_url
 
@@ -16,21 +19,32 @@ def fetch_all_school_districts(output_csv):
     try:
         while url:
             # We add a longer timeout and handle CF blocks
-            response = requests.get(url, timeout=60)
+            response = requests.get(url, timeout=30)
             if response.status_code != 200:
-                logging.error(f"Failed to fetch data from {url}. Status Code: {response.status_code}")
-                break
+                logging.error(f"Failed to fetch data from {url}. Status Code: {response.status_code}. Retrying...")
+                time.sleep(2)
+                response = requests.get(url, timeout=30)
+                if response.status_code != 200:
+                     logging.error("Failed again. Moving on...")
+                     break
 
             data = response.json()
             results = data.get("results", [])
 
             for district in results:
                 name = district.get("lea_name")
-                state = district.get("state_location") # Get the state to improve search accuracy
+                state = district.get("state_location")
+                website = district.get("url", "")
                 agency_type = district.get("agency_type", 0)
+
                 if name and state and agency_type in [1, 2, 3]:
                     if "Department of Education" not in name:
-                        districts.add((name, state))
+                        key = (name, state)
+                        if key not in districts:
+                            districts[key] = website
+                        elif website and not districts[key]:
+                            # Update with website if we didn't have one
+                            districts[key] = website
 
             url = data.get("next")
 
@@ -41,9 +55,9 @@ def fetch_all_school_districts(output_csv):
 
         with open(output_csv, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
-            writer.writerow(["District Name", "State"])
-            for district_tuple in sorted(list(districts)):
-                writer.writerow([district_tuple[0], district_tuple[1]])
+            writer.writerow(["District Name", "State", "Website"])
+            for (name, state), website in sorted(districts.items()):
+                writer.writerow([name, state, website])
 
         logging.info("Complete.")
 
