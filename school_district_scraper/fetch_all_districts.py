@@ -15,7 +15,8 @@ def fetch_all_school_districts(output_csv):
 
     try:
         while url:
-            response = requests.get(url, timeout=30)
+            # We add a longer timeout and handle CF blocks
+            response = requests.get(url, timeout=60)
             if response.status_code != 200:
                 logging.error(f"Failed to fetch data from {url}. Status Code: {response.status_code}")
                 break
