@@ -87,18 +87,39 @@ def get_official_domain(district_name, state=""):
 def extract_contact_with_llm(text):
     try:
         from openai import OpenAI
+        import os
         client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-        prompt = f"""
-        Extract the Name, Title, and Email of EVERY person you can find who works in the "Food Service" or "Child Nutrition" department from the following website text.
-        This includes Directors, Managers, Dietitians, Supervisors, Buyers, Coordinators, and standard staff (e.g. Cafeteria Staff, Cook, etc).
-        If titles are not explicitly "Food Service", look for roles related to food, nutrition, cafeteria, meals, etc.
-        Return it as a JSON object containing a list named 'contacts'.
-        If you cannot find anyone, return an empty list for 'contacts'.
-        Format: {{"contacts": [{{"Name": "...", "Title": "...", "Email": "..."}}]}}
+        prompt = f'''
+        Extract the contact information for the following 9 specific roles within the "Food Service" or "Child Nutrition" department from the provided text.
+
+        Roles to look for:
+        1. Director of Child Nutrition / Food Service Director
+        2. Director of Nutrition Services / Assistant Director
+        3. Dietitian / Registered Dietitian
+        4. Menu Planner / SNS (School Nutrition Specialist)
+        5. Nutrition Specialist / Procurement Specialist
+        6. Buyer / Coordinator
+        7. Field Supervisor / Supervisor
+        8. Cafeteria Manager / Area Manager
+        9. Production Manager
+
+        If you find a person that generally matches one of these roles, map them to the best fit.
+        Return it as a JSON object containing a dictionary named 'contacts' where the keys are the exact role names listed above.
+        For each role, provide a dictionary with "Name", "Title", and "Email".
+        If a specific role is vacant or not listed in the text, set the "Name", "Title", and "Email" fields to "Not Found".
+
+        Format:
+        {{
+          "contacts": {{
+            "Director of Child Nutrition / Food Service Director": {{"Name": "...", "Title": "...", "Email": "..."}},
+            "Director of Nutrition Services / Assistant Director": {{"Name": "...", "Title": "...", "Email": "..."}},
+            ...
+          }}
+        }}
 
         Text: {text[:25000]}
-        """
+        '''
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -108,10 +129,11 @@ def extract_contact_with_llm(text):
         )
 
         import json
-        return json.loads(response.choices[0].message.content).get('contacts', [])
+        return json.loads(response.choices[0].message.content).get('contacts', {})
     except Exception as e:
+        import logging
         logging.error(f"LLM Extraction failed: {e}")
-        return []
+        return {}
 
 def crawl_for_nutrition_contact(district_name, state="", website="", use_llm=False):
     logging.info(f"Looking up domain for {district_name} ({state})...")
@@ -129,12 +151,27 @@ def crawl_for_nutrition_contact(district_name, state="", website="", use_llm=Fal
 
         if not domain:
             clean_name = re.sub(r'[^a-zA-Z0-9]', '', district_name).lower()
-            if "isd" in clean_name:
-                domain = f"https://www.{clean_name}.org"
-            elif "usd" in clean_name:
-                domain = f"https://www.{clean_name}.org"
-            else:
-                domain = f"https://www.{clean_name}.org"
+            state_lower = state.lower() if state else "us"
+
+            # Domains to try in order
+            domains_to_try = [
+                f"https://www.{clean_name}.org",
+                f"https://www.{clean_name}.net",
+                f"https://www.{clean_name}.com",
+                f"https://www.{clean_name}.us",
+                f"https://www.{clean_name}.k12.{state_lower}.us"
+            ]
+
+            # We will default to .org if all fail, but we'll try to find a valid one first
+            domain = domains_to_try[0]
+            for try_domain in domains_to_try:
+                try:
+                    res = requests.head(try_domain, timeout=2, headers={"User-Agent": "Mozilla/5.0"})
+                    if res.status_code < 400:
+                        domain = try_domain
+                        break
+                except:
+                    continue
             logging.warning(f"Could not find domain via search. Guessing {domain}")
 
     logging.info(f"Found domain: {domain}")
@@ -142,7 +179,12 @@ def crawl_for_nutrition_contact(district_name, state="", website="", use_llm=Fal
     pages_to_crawl = []
     pages_to_crawl.append(domain)
 
-    for path in ['/staff', '/departments', '/food-service', '/dining', '/nutrition', '/child-nutrition', '/food-and-nutrition', '/food-service-department', '/apps/staff/', '/apps/departments/', '/departments/food-service']:
+    for path in [
+        '/staff', '/departments', '/food-service', '/dining', '/nutrition',
+        '/child-nutrition', '/food-and-nutrition', '/food-service-department',
+        '/apps/staff/', '/apps/departments/', '/departments/food-service',
+        '/staff-directory', '/administration', '/departments/child-nutrition'
+    ]:
         pages_to_crawl.append(f"{domain}{path}")
 
     all_text = ""
@@ -198,6 +240,17 @@ def crawl_for_nutrition_contact(district_name, state="", website="", use_llm=Fal
             res = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, timeout=10)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, 'html.parser')
+
+                # Extract mailto links directly
+                for a in soup.find_all('a', href=True):
+                    if a['href'].startswith('mailto:'):
+                        email_addr = a['href'][7:].split('?')[0].strip()
+                        emails.add(email_addr)
+                        # Also add a hint to the text so LLM can use it
+                        name_hint = a.get_text().strip()
+                        if name_hint and email_addr not in name_hint:
+                            all_text += f"\nContact: {name_hint} Email: {email_addr}\n"
+
                 text = soup.get_text(separator='\n', strip=True)
                 if text not in all_text:
                     all_text += text + "\n\n"
@@ -242,19 +295,37 @@ def crawl_for_nutrition_contact(district_name, state="", website="", use_llm=Fal
                 "Email": e
             })
 
-    unique_contacts = []
-    seen_emails = set()
+    # In fallback, try to build a dict structured like the LLM output
+    unique_contacts_dict = {}
+
+    ROLES = [
+        "Director of Child Nutrition / Food Service Director",
+        "Director of Nutrition Services / Assistant Director",
+        "Dietitian / Registered Dietitian",
+        "Menu Planner / SNS (School Nutrition Specialist)",
+        "Nutrition Specialist / Procurement Specialist",
+        "Buyer / Coordinator",
+        "Field Supervisor / Supervisor",
+        "Cafeteria Manager / Area Manager",
+        "Production Manager"
+    ]
+
+    # Initialize all with Not Found
+    for role in ROLES:
+        unique_contacts_dict[role] = {"Name": "Not Found", "Title": "Not Found", "Email": "Not Found"}
+
     seen_names = set()
     for c in fallback_contacts:
-        # Ignore poor quality fallback names
-        if len(c['Name']) < 4 or len(c['Name']) > 40 or any(x in c['Name'].lower() for x in ['staff', 'menu', 'update', 'department', 'program', 'service', 'nutrition']):
+        if len(c['Name']) < 4 or len(c['Name']) > 40 or any(x in c['Name'].lower() for x in ['menu', 'update', 'department', 'program', 'service', 'nutrition']):
              continue
         key = c['Email'] + c['Name']
         if key not in seen_names:
-            unique_contacts.append(c)
             seen_names.add(key)
+            # Just assign the first one found to Director as a fallback guess
+            if unique_contacts_dict["Director of Child Nutrition / Food Service Director"]["Name"] == "Not Found":
+                unique_contacts_dict["Director of Child Nutrition / Food Service Director"] = c
 
-    return unique_contacts
+    return unique_contacts_dict
 
 def process_districts(input_csv, output_csv, use_llm=False):
     try:
@@ -277,28 +348,37 @@ def process_districts(input_csv, output_csv, use_llm=False):
 
         contacts = crawl_for_nutrition_contact(district_name, state, website, use_llm)
 
-        if not contacts:
-             district_info = {
-                'District Name': district_name,
-                'State': state,
-                'Website': website,
-                'Child Nutrition / Food Service Role 1 - Name': 'Not Found',
-                'Child Nutrition / Food Service Role 1 - Title': 'Not Found',
-                'Child Nutrition / Food Service Role 1 - Email': 'Not Found'
-             }
-             output_data.append(district_info)
-        else:
-            district_info = {
-                'District Name': district_name,
-                'State': state,
-                'Website': website
-            }
-            for i, c in enumerate(contacts[:5]):
-                district_info[f'Child Nutrition / Food Service Role {i+1} - Name'] = c.get('Name', 'Not Found')
-                district_info[f'Child Nutrition / Food Service Role {i+1} - Title'] = c.get('Title', 'Not Found')
-                district_info[f'Child Nutrition / Food Service Role {i+1} - Email'] = c.get('Email', 'Not Found')
+        ROLES = [
+            "Director of Child Nutrition / Food Service Director",
+            "Director of Nutrition Services / Assistant Director",
+            "Dietitian / Registered Dietitian",
+            "Menu Planner / SNS (School Nutrition Specialist)",
+            "Nutrition Specialist / Procurement Specialist",
+            "Buyer / Coordinator",
+            "Field Supervisor / Supervisor",
+            "Cafeteria Manager / Area Manager",
+            "Production Manager"
+        ]
 
-            output_data.append(district_info)
+        district_info = {
+            'District Name': district_name,
+            'State': state,
+            'Website': website
+        }
+
+        if not contacts or not isinstance(contacts, dict):
+            for role in ROLES:
+                district_info[f'{role} - Name'] = 'Not Found'
+                district_info[f'{role} - Title'] = 'Not Found'
+                district_info[f'{role} - Email'] = 'Not Found'
+        else:
+            for role in ROLES:
+                role_data = contacts.get(role, {})
+                district_info[f'{role} - Name'] = role_data.get('Name', 'Not Found')
+                district_info[f'{role} - Title'] = role_data.get('Title', 'Not Found')
+                district_info[f'{role} - Email'] = role_data.get('Email', 'Not Found')
+
+        output_data.append(district_info)
 
         pd.DataFrame(output_data).to_csv(output_csv, index=False)
         logging.info(f"Saved progress for {district_name} to {output_csv}")
