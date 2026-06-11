@@ -28,7 +28,7 @@ def fetch_all_school_districts(output_csv):
                 name = district.get("lea_name")
                 state = district.get("state_location") # Get the state to improve search accuracy
                 agency_type = district.get("agency_type", 0)
-                if name and state and agency_type in [1, 2, 3]:
+                if name and state and state == "MI" and agency_type in [1, 2, 3]:
                     if "Department of Education" not in name:
                         districts.add((name, state))
 
